@@ -1,5 +1,6 @@
 import asyncio
 import os
+import asyncpg
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
@@ -15,24 +16,29 @@ from aiogram.fsm.context import FSMContext
 # ============ НАСТРОЙКИ ============
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 # ===================================
 
 if not BOT_TOKEN:
     raise ValueError("Не задан BOT_TOKEN!")
 if not ADMIN_ID:
     raise ValueError("Не задан ADMIN_ID!")
+if not DATABASE_URL:
+    raise ValueError("Не задан DATABASE_URL!")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-users_data = {}
+db_pool = None  # Пул соединений
 
 
+# ===== СОСТОЯНИЯ =====
 class OrderFlow(StatesGroup):
     waiting_age = State()
     waiting_gender = State()
 
 
+# ===== КЛАВИАТУРА =====
 def get_products_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -44,12 +50,40 @@ def get_products_kb():
     )
 
 
+# ===== ИНИЦИАЛИЗАЦИЯ БД =====
+async def init_db():
+    global db_pool
+    # Пул соединений (рекомендуется для asyncpg)
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5
+    )
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                user_id BIGINT PRIMARY KEY,
+                product TEXT NOT NULL,
+                age TEXT NOT NULL,
+                gender TEXT NOT NULL,
+                username TEXT,
+                full_name TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                status TEXT DEFAULT 'pending'
+            )
+        """)
+    print("✅ База данных готова")
+
+
+# ===== /start =====
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Привет! Выбери услугу:", reply_markup=get_products_kb())
 
 
+# ===== КОМАНДА /send =====
 @dp.message(Command("send"))
 async def admin_send(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -77,6 +111,7 @@ async def admin_send(message: Message):
         await message.answer(f"⚠️ Ошибка: {e}")
 
 
+# ===== КНОПКА «100 рублей за кружок» =====
 @dp.message(F.text == "100 рублей за кружок")
 async def choose_circle(message: Message, state: FSMContext):
     await state.update_data(product="100 рублей за кружок")
@@ -84,6 +119,7 @@ async def choose_circle(message: Message, state: FSMContext):
     await message.answer("сколько тебе лет?", reply_markup=ReplyKeyboardRemove())
 
 
+# ===== КНОПКА «50 рублей за гс» =====
 @dp.message(F.text == "50 рублей за гс")
 async def choose_gs(message: Message, state: FSMContext):
     await state.update_data(product="50 рублей за гс")
@@ -91,6 +127,7 @@ async def choose_gs(message: Message, state: FSMContext):
     await message.answer("сколько тебе лет?", reply_markup=ReplyKeyboardRemove())
 
 
+# ===== ПОЛУЧАЕМ ВОЗРАСТ =====
 @dp.message(OrderFlow.waiting_age)
 async def get_age(message: Message, state: FSMContext):
     await state.update_data(age=message.text)
@@ -98,18 +135,33 @@ async def get_age(message: Message, state: FSMContext):
     await message.answer("напиши свой пол")
 
 
+# ===== ПОЛУЧАЕМ ПОЛ → СОХРАНЯЕМ В БД → ШЛЁМ АДМИНУ =====
 @dp.message(OrderFlow.waiting_gender)
 async def get_gender(message: Message, state: FSMContext):
     await state.update_data(gender=message.text)
     data = await state.get_data()
 
-    users_data[message.from_user.id] = {
-        "product": data["product"],
-        "age": data["age"],
-        "gender": data["gender"],
-        "username": message.from_user.username or "нет",
-        "name": message.from_user.full_name,
-    }
+    # СОХРАНЯЕМ В БАЗУ ДАННЫХ
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO orders (user_id, product, age, gender, username, full_name)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (user_id) DO UPDATE SET
+                product = EXCLUDED.product,
+                age = EXCLUDED.age,
+                gender = EXCLUDED.gender,
+                username = EXCLUDED.username,
+                full_name = EXCLUDED.full_name,
+                created_at = NOW(),
+                status = 'pending'
+        """,
+            message.from_user.id,
+            data["product"],
+            data["age"],
+            data["gender"],
+            message.from_user.username or "",
+            message.from_user.full_name
+        )
 
     await message.answer("дождись проверки администратора")
     await state.clear()
@@ -134,9 +186,14 @@ async def get_gender(message: Message, state: FSMContext):
     await bot.send_message(ADMIN_ID, text, reply_markup=admin_kb, parse_mode="HTML")
 
 
+# ===== ✅ ОДОБРИТЬ =====
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve_user(callback: CallbackQuery):
     user_id = int(callback.data.split("_")[1])
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE orders SET status = 'approved' WHERE user_id = $1", user_id)
+
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(
         f"✅ Одобрено. Напиши:\n<code>/send {user_id} твой текст</code>",
@@ -145,9 +202,14 @@ async def approve_user(callback: CallbackQuery):
     await callback.answer()
 
 
+# ===== ❌ ОТКЛОНИТЬ =====
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_user(callback: CallbackQuery):
     user_id = int(callback.data.split("_")[1])
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE orders SET status = 'rejected' WHERE user_id = $1", user_id)
+
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(f"❌ Заявка {user_id} отклонена.")
     try:
@@ -157,6 +219,7 @@ async def reject_user(callback: CallbackQuery):
     await callback.answer()
 
 
+# ===== ЗАГЛУШКА-СЕРВЕР ДЛЯ RENDER =====
 async def handle_ping(request):
     return web.Response(text="Bot is alive")
 
@@ -169,10 +232,13 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
+
 async def main():
-    await start_web_server()
+    await init_db()          # Подключаемся к БД
+    await start_web_server() # Запускаем заглушку для Render
     print("Бот запущен...")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
