@@ -42,8 +42,9 @@ class OrderFlow(StatesGroup):
 def get_products_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="100 рублей за кружок")],
-            [KeyboardButton(text="50 рублей за гс")],
+            [KeyboardButton(text="350 рублей за кружок")],
+            [KeyboardButton(text="200 рублей за гс")],
+            [KeyboardButton(text="600 рублей за кружок + @username")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выбери услугу..."
@@ -112,17 +113,24 @@ async def admin_send(message: Message):
 
 
 # ===== КНОПКА «100 рублей за кружок» =====
-@dp.message(F.text == "100 рублей за кружок")
+@dp.message(F.text == "350 рублей за кружок")
 async def choose_circle(message: Message, state: FSMContext):
-    await state.update_data(product="100 рублей за кружок")
+    await state.update_data(product="350 рублей за кружок")
     await state.set_state(OrderFlow.waiting_age)
     await message.answer("сколько тебе лет?", reply_markup=ReplyKeyboardRemove())
 
 
 # ===== КНОПКА «50 рублей за гс» =====
-@dp.message(F.text == "50 рублей за гс")
+@dp.message(F.text == "200 рублей за гс")
 async def choose_gs(message: Message, state: FSMContext):
-    await state.update_data(product="50 рублей за гс")
+    await state.update_data(product="200 рублей за гс")
+    await state.set_state(OrderFlow.waiting_age)
+    await message.answer("сколько тебе лет?", reply_markup=ReplyKeyboardRemove())
+
+
+@dp.message(F.text == "600 рублей за кружок + @username")
+async def choose_circle_username(message: Message, state: FSMContext):
+    await state.update_data(product="600 рублей за кружок + @username")
     await state.set_state(OrderFlow.waiting_age)
     await message.answer("сколько тебе лет?", reply_markup=ReplyKeyboardRemove())
 
